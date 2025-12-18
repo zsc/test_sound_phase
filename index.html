@@ -102,7 +102,6 @@
 <script>
 /**
  * Simple FFT Implementation (Cooley-Tukey)
- * Since AudioContext AnalyserNode does not provide Phase data, we must compute FFT manually.
  */
 class SimpleFFT {
     constructor(bufferSize) {
@@ -135,9 +134,7 @@ class SimpleFFT {
         const real = new Float32Array(bufferSize);
         const imag = new Float32Array(bufferSize);
         
-        // Windowing (Hanning) and bit-reversal
         for (let i = 0; i < bufferSize; i++) {
-            // Hanning window
             const window = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (bufferSize - 1)));
             real[i] = buffer[this.reverseTable[i]] * window;
             imag[i] = 0;
@@ -188,16 +185,14 @@ let scriptNode;
 let fft;
 let isRunning = false;
 
-// Config
-const BUFFER_SIZE = 2048; // Must be power of 2
-const MEL_BANDS = 128;    // Height of the visualization
+// --- FIXED CONFIG ---
+const BUFFER_SIZE = 4096; // 增加 Buffer Size 以支持更高的 Mel 分辨率
+const MEL_BANDS = 400;    // 必须等于 Canvas Height (400)
 const MIN_FREQ = 20;
-const MAX_FREQ = 8000;    // Cap at 8kHz for speech clarity
+const MAX_FREQ = 8000;    
 
-// Precomputed Mel scale map
 let melMap = []; 
 
-// Offscreen canvas for scrolling effect
 const tempCanvas = document.createElement('canvas');
 tempCanvas.width = canvas.width;
 tempCanvas.height = canvas.height;
@@ -231,10 +226,6 @@ function createMelFilterBank(sampleRate, bufferSize) {
     const maxMel = hzToMel(MAX_FREQ);
     const melStep = (maxMel - minMel) / (MEL_BANDS + 1);
 
-    // Creates a mapping from FFT bin index to Mel band index
-    // To preserve phase, for each Mel band we will pick the "Center Frequency" bin
-    // or sum magnitudes for the Amplitude part.
-    
     for (let m = 0; m < MEL_BANDS; m++) {
         const startMel = minMel + m * melStep;
         const centerMel = minMel + (m + 1) * melStep;
@@ -244,13 +235,16 @@ function createMelFilterBank(sampleRate, bufferSize) {
         const centerHz = melToHz(centerMel);
         const endHz = melToHz(endMel);
 
-        const startBin = Math.floor(startHz / (sampleRate / bufferSize));
-        const centerBin = Math.floor(centerHz / (sampleRate / bufferSize));
-        const endBin = Math.floor(endHz / (sampleRate / bufferSize));
+        const freqPerBin = sampleRate / bufferSize;
+        let startBin = Math.floor(startHz / freqPerBin);
+        let centerBin = Math.floor(centerHz / freqPerBin);
+        let endBin = Math.floor(endHz / freqPerBin);
 
-        filters.push({
-            startBin, centerBin, endBin
-        });
+        // Safety check: ensure we capture at least one bin
+        if (endBin <= startBin) endBin = startBin + 1;
+        if (centerBin < startBin) centerBin = startBin;
+
+        filters.push({ startBin, centerBin, endBin });
     }
     return filters;
 }
@@ -265,7 +259,6 @@ startBtn.addEventListener('click', async () => {
         
         source = audioCtx.createMediaStreamSource(stream);
         
-        // Deprecated but works everywhere in single file without AudioWorklet complexity
         scriptNode = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1);
         
         fft = new SimpleFFT(BUFFER_SIZE);
@@ -274,12 +267,11 @@ startBtn.addEventListener('click', async () => {
         scriptNode.onaudioprocess = (audioProcessingEvent) => {
             const inputBuffer = audioProcessingEvent.inputBuffer;
             const inputData = inputBuffer.getChannelData(0);
-            
             processAudio(inputData);
         };
 
         source.connect(scriptNode);
-        scriptNode.connect(audioCtx.destination); // Needed for script processor to fire
+        scriptNode.connect(audioCtx.destination); 
         
         startBtn.disabled = true;
         startBtn.innerText = "Running...";
@@ -292,28 +284,20 @@ startBtn.addEventListener('click', async () => {
 });
 
 function processAudio(timeData) {
-    // 1. Calculate FFT
     const { real, imag } = fft.calculate(timeData);
     
-    // 2. Prepare pixel column
-    // We draw a 1px wide line for the current frame
     const imgData = ctx.createImageData(1, MEL_BANDS);
     const data = imgData.data;
     
     const mode = modeSelect.value;
     const thresholdPercent = parseInt(thresholdSlider.value);
-    // Rough normalization factor based on buffer size
-    const scalar = 100 / BUFFER_SIZE; 
-
-    // Iterate Mel bands (Y-axis), note: canvas 0,0 is top-left.
-    // We usually want low freq at bottom, so we iterate inverted or flip canvas.
-    // Here we map index 0 -> Bottom.
     
+    // Normalize factor (adjusted for larger buffer)
+    const scalar = 200 / BUFFER_SIZE; 
+
     for (let i = 0; i < MEL_BANDS; i++) {
         const filter = melMap[i];
         
-        // --- A. Calculate Magnitude for this Mel Band ---
-        // Summing energy in the bins for this band
         let magSum = 0;
         let maxBinVal = -1;
         let maxBinIndex = filter.centerBin;
@@ -323,61 +307,39 @@ function processAudio(timeData) {
             const m = Math.sqrt(real[b]*real[b] + imag[b]*imag[b]);
             magSum += m;
             
-            // Track the dominant frequency bin for Phase calculation
-            // (Averaging phase creates noise, picking dominant bin is cleaner)
             if (m > maxBinVal) {
                 maxBinVal = m;
                 maxBinIndex = b;
             }
         }
         
-        // Logarithmic Magnitude scaling
         let mag = Math.log1p(magSum * scalar) * 50; 
         mag = Math.min(255, Math.max(0, mag));
 
-        // --- B. Calculate Phase ---
-        // Using the bin with highest energy in this band
-        const re = real[maxBinIndex];
-        const im = imag[maxBinIndex];
-        let phase = Math.atan2(im, re); // -PI to PI
+        // Get Phase from dominant bin
+        const re = real[maxBinIndex] || 0;
+        const im = imag[maxBinIndex] || 0;
+        let phase = Math.atan2(im, re); 
         
-        // --- Drawing Logic ---
-        
-        // Invert Y axis: i=0 is low freq (bottom of canvas)
-        // Canvas data array is row-major from top-left.
-        // So row y = (MEL_BANDS - 1 - i)
+        // Invert Y axis so low freq is at bottom
         const pixelIndex = (MEL_BANDS - 1 - i) * 4;
 
         if (mode === 'A') {
-            // Mode A: 3-Channel
-            // Channel 1 (R): Spectrogram (Magnitude)
-            // Channel 2 (G): Cos Phase
-            // Channel 3 (B): Sin Phase
-            
-            // Threshold Logic
-            // If mag is very low, set phase to 0. 
-            // Phase 0 means angle = 0, so Cos(0)=1, Sin(0)=0.
-            if (mag < (thresholdPercent * 2.55)) { // Convert % to 0-255 roughly
+            if (mag < (thresholdPercent * 2.55)) { 
                 phase = 0;
             }
 
             const valCos = Math.cos(phase);
             const valSin = Math.sin(phase);
 
-            // Map -1..1 to 0..255
             const g = Math.floor((valCos + 1) * 127.5);
             const b = Math.floor((valSin + 1) * 127.5);
             
             data[pixelIndex] = mag;     // R
             data[pixelIndex + 1] = g;   // G
             data[pixelIndex + 2] = b;   // B
-            data[pixelIndex + 3] = 255; // Alpha
+            data[pixelIndex + 3] = 255; 
         } else {
-            // Mode B: Mel Spectrogram (Heatmap style)
-            // Simple Magma-like coloring or just Grayscale/Red
-            
-            // Let's do a simple "Hot" colormap
-            // Low = Black/Purple, Mid = Red, High = Yellow
             const r = mag * 1.5;
             const g = (mag - 100) * 2;
             const b = (mag - 180) * 4;
@@ -389,14 +351,8 @@ function processAudio(timeData) {
         }
     }
 
-    // Scroll effect
-    // 1. Draw current mainCanvas to tempCanvas
     tempCtx.drawImage(canvas, 0, 0);
-    
-    // 2. Draw tempCanvas back to mainCanvas shifted by -1 pixel
     ctx.drawImage(tempCanvas, -1, 0);
-    
-    // 3. Draw the new strip at the right edge
     ctx.putImageData(imgData, canvas.width - 1, 0);
 }
 </script>
