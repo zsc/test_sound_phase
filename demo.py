@@ -230,5 +230,5 @@ def audio_stream_loop():
 if __name__ == '__main__':
     # 启动音频线程
     t = socketio.start_background_task(audio_stream_loop)
-    print("Starting server at http://127.0.0.1:5000")
-    socketio.run(app, port=5000, debug=False)
+    print("Starting server at http://0.0.0.0:8888")
+    socketio.run(app, host="0.0.0.0", port=8888, debug=False)

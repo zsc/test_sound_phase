@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audio Phase & Mel Spectrogram Analyzer</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #121212;
+            color: #e0e0e0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin: 0;
+            padding: 20px;
+        }
+        h1 { margin-bottom: 10px; font-size: 1.5rem; }
+        .controls {
+            display: flex;
+            gap: 20px;
+            background: #1e1e1e;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            align-items: center;
+            flex-wrap: wrap;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        button {
+            padding: 10px 20px;
+            background-color: #007acc;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        button:hover { background-color: #005f9e; }
+        button:disabled { background-color: #444; cursor: not-allowed; }
+        
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        label { font-size: 0.9rem; color: #aaa; }
+        select, input[type="range"] {
+            background: #333;
+            color: white;
+            border: 1px solid #555;
+            padding: 5px;
+            border-radius: 4px;
+        }
+        
+        #canvas-container {
+            position: relative;
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+            border: 1px solid #333;
+        }
+        canvas { display: block; background-color: black; }
+        
+        .legend {
+            margin-top: 10px;
+            font-size: 0.8rem;
+            color: #888;
+            max-width: 800px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>All-in-One Audio Analysis</h1>
+
+    <div class="controls">
+        <button id="startBtn">Start Microphone</button>
+        
+        <div class="control-group">
+            <label for="modeSelect">Visualization Mode</label>
+            <select id="modeSelect">
+                <option value="A">Mode A: 3-Channel (Mag/Cos/Sin)</option>
+                <option value="B">Mode B: Mel Spectrogram</option>
+            </select>
+        </div>
+
+        <div class="control-group" id="threshGroup">
+            <label for="threshold">Phase Threshold (0 - 255)</label>
+            <input type="range" id="threshold" min="0" max="100" value="10">
+            <span id="threshVal" style="font-size: 0.8em; color: #888;">10%</span>
+        </div>
+    </div>
+
+    <div id="canvas-container">
+        <canvas id="mainCanvas" width="800" height="400"></canvas>
+    </div>
+
+    <div class="legend" id="legendText">
+        Mode A: R = Magnitude (Mel), G = Cos(Phase), B = Sin(Phase).
+    </div>
+
+<script>
+/**
+ * Simple FFT Implementation (Cooley-Tukey)
+ * Since AudioContext AnalyserNode does not provide Phase data, we must compute FFT manually.
+ */
+class SimpleFFT {
+    constructor(bufferSize) {
+        this.bufferSize = bufferSize;
+        this.reverseTable = new Uint32Array(bufferSize);
+        this.sinTable = new Float32Array(bufferSize);
+        this.cosTable = new Float32Array(bufferSize);
+
+        let limit = 1;
+        let bit = bufferSize >> 1;
+        let i;
+
+        while (limit < bufferSize) {
+            for (i = 0; i < limit; i++) {
+                this.reverseTable[i + limit] = this.reverseTable[i] + bit;
+            }
+            limit = limit << 1;
+            bit = bit >> 1;
+        }
+
+        for (i = 0; i < bufferSize; i++) {
+            this.sinTable[i] = Math.sin(-Math.PI / i);
+            this.cosTable[i] = Math.cos(-Math.PI / i);
+        }
+    }
+
+    calculate(buffer) {
+        const k = Math.floor(Math.log(this.bufferSize) / Math.LN2);
+        const bufferSize = this.bufferSize;
+        const real = new Float32Array(bufferSize);
+        const imag = new Float32Array(bufferSize);
+        
+        // Windowing (Hanning) and bit-reversal
+        for (let i = 0; i < bufferSize; i++) {
+            // Hanning window
+            const window = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (bufferSize - 1)));
+            real[i] = buffer[this.reverseTable[i]] * window;
+            imag[i] = 0;
+        }
+
+        let halfSize = 1;
+        while (halfSize < bufferSize) {
+            const phaseShiftStepReal = Math.cos(-Math.PI / halfSize);
+            const phaseShiftStepImag = Math.sin(-Math.PI / halfSize);
+            
+            let currentPhaseShiftReal = 1;
+            let currentPhaseShiftImag = 0;
+
+            for (let fftStep = 0; fftStep < halfSize; fftStep++) {
+                for (let i = fftStep; i < bufferSize; i += 2 * halfSize) {
+                    const off = i + halfSize;
+                    const tr = (currentPhaseShiftReal * real[off]) - (currentPhaseShiftImag * imag[off]);
+                    const ti = (currentPhaseShiftReal * imag[off]) + (currentPhaseShiftImag * real[off]);
+
+                    real[off] = real[i] - tr;
+                    imag[off] = imag[i] - ti;
+                    real[i] += tr;
+                    imag[i] += ti;
+                }
+                const tmpReal = currentPhaseShiftReal;
+                currentPhaseShiftReal = (tmpReal * phaseShiftStepReal) - (currentPhaseShiftImag * phaseShiftStepImag);
+                currentPhaseShiftImag = (tmpReal * phaseShiftStepImag) + (currentPhaseShiftImag * phaseShiftStepReal);
+            }
+            halfSize <<= 1;
+        }
+        return { real, imag };
+    }
+}
+
+// --- App Logic ---
+
+const canvas = document.getElementById('mainCanvas');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+const startBtn = document.getElementById('startBtn');
+const modeSelect = document.getElementById('modeSelect');
+const thresholdSlider = document.getElementById('threshold');
+const threshVal = document.getElementById('threshVal');
+const legendText = document.getElementById('legendText');
+
+let audioCtx;
+let source;
+let scriptNode;
+let fft;
+let isRunning = false;
+
+// Config
+const BUFFER_SIZE = 2048; // Must be power of 2
+const MEL_BANDS = 128;    // Height of the visualization
+const MIN_FREQ = 20;
+const MAX_FREQ = 8000;    // Cap at 8kHz for speech clarity
+
+// Precomputed Mel scale map
+let melMap = []; 
+
+// Offscreen canvas for scrolling effect
+const tempCanvas = document.createElement('canvas');
+tempCanvas.width = canvas.width;
+tempCanvas.height = canvas.height;
+const tempCtx = tempCanvas.getContext('2d');
+
+thresholdSlider.addEventListener('input', (e) => {
+    threshVal.innerText = e.target.value + '%';
+});
+
+modeSelect.addEventListener('change', (e) => {
+    if(e.target.value === 'A') {
+        legendText.innerText = "Mode A: R=Mag, G=Cos(Phase), B=Sin(Phase). Low amplitude forces Phase=0.";
+        document.getElementById('threshGroup').style.opacity = '1';
+    } else {
+        legendText.innerText = "Mode B: Standard Mel Spectrogram (Color = Magnitude)";
+        document.getElementById('threshGroup').style.opacity = '0.3';
+    }
+});
+
+function hzToMel(hz) {
+    return 2595 * Math.log10(1 + hz / 700);
+}
+
+function melToHz(mel) {
+    return 700 * (Math.pow(10, mel / 2595) - 1);
+}
+
+function createMelFilterBank(sampleRate, bufferSize) {
+    const filters = [];
+    const minMel = hzToMel(MIN_FREQ);
+    const maxMel = hzToMel(MAX_FREQ);
+    const melStep = (maxMel - minMel) / (MEL_BANDS + 1);
+
+    // Creates a mapping from FFT bin index to Mel band index
+    // To preserve phase, for each Mel band we will pick the "Center Frequency" bin
+    // or sum magnitudes for the Amplitude part.
+    
+    for (let m = 0; m < MEL_BANDS; m++) {
+        const startMel = minMel + m * melStep;
+        const centerMel = minMel + (m + 1) * melStep;
+        const endMel = minMel + (m + 2) * melStep;
+        
+        const startHz = melToHz(startMel);
+        const centerHz = melToHz(centerMel);
+        const endHz = melToHz(endMel);
+
+        const startBin = Math.floor(startHz / (sampleRate / bufferSize));
+        const centerBin = Math.floor(centerHz / (sampleRate / bufferSize));
+        const endBin = Math.floor(endHz / (sampleRate / bufferSize));
+
+        filters.push({
+            startBin, centerBin, endBin
+        });
+    }
+    return filters;
+}
+
+startBtn.addEventListener('click', async () => {
+    if (isRunning) return;
+    
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const sampleRate = audioCtx.sampleRate;
+        
+        source = audioCtx.createMediaStreamSource(stream);
+        
+        // Deprecated but works everywhere in single file without AudioWorklet complexity
+        scriptNode = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1);
+        
+        fft = new SimpleFFT(BUFFER_SIZE);
+        melMap = createMelFilterBank(sampleRate, BUFFER_SIZE);
+
+        scriptNode.onaudioprocess = (audioProcessingEvent) => {
+            const inputBuffer = audioProcessingEvent.inputBuffer;
+            const inputData = inputBuffer.getChannelData(0);
+            
+            processAudio(inputData);
+        };
+
+        source.connect(scriptNode);
+        scriptNode.connect(audioCtx.destination); // Needed for script processor to fire
+        
+        startBtn.disabled = true;
+        startBtn.innerText = "Running...";
+        isRunning = true;
+        
+    } catch (err) {
+        console.error("Error accessing microphone:", err);
+        alert("Microphone access denied or error occurred.");
+    }
+});
+
+function processAudio(timeData) {
+    // 1. Calculate FFT
+    const { real, imag } = fft.calculate(timeData);
+    
+    // 2. Prepare pixel column
+    // We draw a 1px wide line for the current frame
+    const imgData = ctx.createImageData(1, MEL_BANDS);
+    const data = imgData.data;
+    
+    const mode = modeSelect.value;
+    const thresholdPercent = parseInt(thresholdSlider.value);
+    // Rough normalization factor based on buffer size
+    const scalar = 100 / BUFFER_SIZE; 
+
+    // Iterate Mel bands (Y-axis), note: canvas 0,0 is top-left.
+    // We usually want low freq at bottom, so we iterate inverted or flip canvas.
+    // Here we map index 0 -> Bottom.
+    
+    for (let i = 0; i < MEL_BANDS; i++) {
+        const filter = melMap[i];
+        
+        // --- A. Calculate Magnitude for this Mel Band ---
+        // Summing energy in the bins for this band
+        let magSum = 0;
+        let maxBinVal = -1;
+        let maxBinIndex = filter.centerBin;
+
+        for (let b = filter.startBin; b < filter.endBin; b++) {
+            if (b >= real.length / 2) break;
+            const m = Math.sqrt(real[b]*real[b] + imag[b]*imag[b]);
+            magSum += m;
+            
+            // Track the dominant frequency bin for Phase calculation
+            // (Averaging phase creates noise, picking dominant bin is cleaner)
+            if (m > maxBinVal) {
+                maxBinVal = m;
+                maxBinIndex = b;
+            }
+        }
+        
+        // Logarithmic Magnitude scaling
+        let mag = Math.log1p(magSum * scalar) * 50; 
+        mag = Math.min(255, Math.max(0, mag));
+
+        // --- B. Calculate Phase ---
+        // Using the bin with highest energy in this band
+        const re = real[maxBinIndex];
+        const im = imag[maxBinIndex];
+        let phase = Math.atan2(im, re); // -PI to PI
+        
+        // --- Drawing Logic ---
+        
+        // Invert Y axis: i=0 is low freq (bottom of canvas)
+        // Canvas data array is row-major from top-left.
+        // So row y = (MEL_BANDS - 1 - i)
+        const pixelIndex = (MEL_BANDS - 1 - i) * 4;
+
+        if (mode === 'A') {
+            // Mode A: 3-Channel
+            // Channel 1 (R): Spectrogram (Magnitude)
+            // Channel 2 (G): Cos Phase
+            // Channel 3 (B): Sin Phase
+            
+            // Threshold Logic
+            // If mag is very low, set phase to 0. 
+            // Phase 0 means angle = 0, so Cos(0)=1, Sin(0)=0.
+            if (mag < (thresholdPercent * 2.55)) { // Convert % to 0-255 roughly
+                phase = 0;
+            }
+
+            const valCos = Math.cos(phase);
+            const valSin = Math.sin(phase);
+
+            // Map -1..1 to 0..255
+            const g = Math.floor((valCos + 1) * 127.5);
+            const b = Math.floor((valSin + 1) * 127.5);
+            
+            data[pixelIndex] = mag;     // R
+            data[pixelIndex + 1] = g;   // G
+            data[pixelIndex + 2] = b;   // B
+            data[pixelIndex + 3] = 255; // Alpha
+        } else {
+            // Mode B: Mel Spectrogram (Heatmap style)
+            // Simple Magma-like coloring or just Grayscale/Red
+            
+            // Let's do a simple "Hot" colormap
+            // Low = Black/Purple, Mid = Red, High = Yellow
+            const r = mag * 1.5;
+            const g = (mag - 100) * 2;
+            const b = (mag - 180) * 4;
+            
+            data[pixelIndex] = r;
+            data[pixelIndex + 1] = g;
+            data[pixelIndex + 2] = b;
+            data[pixelIndex + 3] = 255;
+        }
+    }
+
+    // Scroll effect
+    // 1. Draw current mainCanvas to tempCanvas
+    tempCtx.drawImage(canvas, 0, 0);
+    
+    // 2. Draw tempCanvas back to mainCanvas shifted by -1 pixel
+    ctx.drawImage(tempCanvas, -1, 0);
+    
+    // 3. Draw the new strip at the right edge
+    ctx.putImageData(imgData, canvas.width - 1, 0);
+}
+</script>
+</body>
+</html>
